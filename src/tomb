@@ -122,6 +122,24 @@ safe_dir() {
     print "$dir"
 }
 
+
+safe_file() {
+    local tmpdir tmpfile
+    tmpdir=`safe_dir tomb`
+    
+    if [ "$tmpdir" = "-1" ]; then
+        echo "-1"
+    fi
+    
+    while true; do
+        tmpfile="${1}".$$.$RANDOM.$RANDOM
+        if ! [ -r "${tmpdir}/${tmpfile}" ]; then
+            break
+        fi
+    done
+    echo "${tmpdir}/${tmpfile}" 
+}
+
 #check if there is swap activated
 check_swap() {
     # Return 0 if NO swap is used, 1 if swap is used
@@ -152,11 +170,14 @@ ask_password() {
 	GTK2_RC=/usr/share/themes/tomb/gtk-2.0-key/gtkrc
     fi
 
+    title="Insert tomb password"
+    if [ $2 ]; then title="$2"; fi
+
     cat <<EOF | GTK2_RC_FILES=${GTK2_RC} pinentry 2>/dev/null | awk '/^D / { sub(/^D /, ""); print }'
 OPTION ttyname=$TTY
 OPTION lc-ctype=$LANG
-SETTITLE Insert tomb password
-SETDESC Open tomb: $1
+SETTITLE $title
+SETDESC $1
 SETPROMPT Password:
 GETPIN
 EOF
@@ -216,6 +237,7 @@ Commands:
  list       list all open tombs or the one called FILE
  close      close the open tomb called FILE (or all)
  slam       close tomb FILE and kill all pids using it
+ passwd     change the password of a tomb key FILE
 EOF
 if [ "$STEGHIDE" = 1 ]; then
     cat <<EOF
@@ -985,6 +1007,110 @@ umount_tomb() {
     return 0
 }
 
+# change tomb key password
+change_passwd() {
+    if ! option_is_set --ignore-swap && [[ `check_swap out` == 1 ]]; then
+        error "You have swap activated; use --ignore-swap if you want to skip this check"
+        act "Using encryption with swap activated is very bad, because some files, or even your secret key, could be written on hard disk."
+        act "However, it could be that your swap is encrypted. If this is case, this is ok. Then, use --ignore-swap to skip this check"
+        act "You seem to be using `tail -n +2 /proc/swaps|wc -l` swaps:"
+        tail -n +2 /proc/swaps
+        return 1
+    fi
+    local keyfile="${1}"
+
+    # check the keyfile
+    if ! [ -r $keyfile ]; then
+	error "key not found: $keyfile"
+	return 1
+    fi
+    file $keyfile | grep PGP > /dev/null
+    if [ $? != 0 ]; then
+	error "file doesn't seems to be a tomb key: $keyfile"
+	error "operation aborted."
+	return 1
+    fi
+
+    local tmpnewkey tmpoldkey c tombpass tombpasstmp
+    
+    tmpnewkey=`safe_file tomb`
+    tmpoldkey=`safe_file tomb`
+    
+    if [ "$tmpnewkey" = "-1" -o "$tmpoldkey" = "-1" ]; then
+	    error "Error creating temp keyfile"
+	    return 1
+    fi
+
+    notice "Changing password for $keyfile"
+    keyname=`basename $keyfile`
+    for c in 1 2 3; do
+	    if [ $c = 1 ]; then
+	        tombpass=`exec_as_user ${TOMBEXEC} askpass "Type old password for ${keyname}" "Change tomb key password"`
+	    else
+	        tombpass=`exec_as_user ${TOMBEXEC} askpass "Type old password for ${keyname} (retry $c)" "Change tomb key password"`
+	    fi
+        gpg --batch --no-options --no-tty --passphrase-fd 0 -o "${tmpoldkey}" -d $keyfile <<< "$tombpass" &> /dev/null
+        if [ $? = 0 ]; then
+            tombpass="ok"
+            break
+        fi
+    done
+
+    if [ "$tombpass" != "ok" ]; then
+        error "You typed an Invalid old password. Operation aborted."
+        ${WIPE[@]} "${tmpnewkey}"
+        ${WIPE[@]} "${tmpoldkey}"
+        rmdir `dirname $tmpoldkey`
+        rmdir `dirname $tmpnewkey`
+        return 1
+    fi
+
+    for c in 1 2 3; do
+	    # 3 tries to write two times a matching password
+	if [ $c = 1 ]; then
+	    tombpass=`exec_as_user ${TOMBEXEC} askpass "Type the new password for ${keyname}" "Change tomb key password"`
+	else
+	    tombpass=`exec_as_user ${TOMBEXEC} askpass "Type the new password for ${keyname} (retry $c)" "Change tomb key password"`
+	fi
+	tombpasstmp=$tombpass
+	tombpass=`exec_as_user ${TOMBEXEC} askpass "Type the new password again" "Change tomb key password"`
+	if [ "$tombpasstmp" = "$tombpass" ]; then
+	    break;
+	fi
+	unset tombpasstmp
+	unset tombpass
+    done
+
+    if [ -z $tombpass ]; then
+	error "You mistyped the new password. Operation aborted."
+        ${WIPE[@]} "${tmpnewkey}"
+        ${WIPE[@]} "${tmpoldkey}"
+        rmdir `dirname $tmpoldkey`
+        rmdir `dirname $tmpnewkey`
+	return 1
+    fi
+
+    gpg \
+	--openpgp --batch --no-options --no-tty --passphrase-fd 0 2>/dev/null \
+	-o "${tmpnewkey}" -c -a ${tmpoldkey} <<< ${tombpass}
+
+    # wipe the previous, original, key
+    ${WIPE[@]} "${keyfile}"
+    # copy the new key as the original keyfile name
+    cp "${tmpnewkey}" "${keyfile}"
+
+    act "Cleaning environment"
+    # wipe all temp file
+    ${WIPE[@]} "${tmpnewkey}"
+    ${WIPE[@]} "${tmpoldkey}"
+    rmdir `dirname $tmpoldkey`
+    rmdir `dirname $tmpnewkey`
+
+    notice "Your passphrase was successfully updated."
+
+    return 0
+}
+
 # list all tombs mounted in a readable format
 list_tombs() {
     if [ $1 ]; then
@@ -1251,6 +1377,7 @@ main() {
     subcommands_opts[open]="n -nohook=n k: -key=k o: -mount-options=o -ignore-swap"
     subcommands_opts[mount]=${subcommands_opts[open]}
     subcommands_opts[create]="s: -size=s -ignore-swap k: -key=k"
+    subcommands_opts[passwd]="-ignore-swap"
     subcommands_opts[close]=""
     subcommands_opts[help]=""
     subcommands_opts[slam]=""
@@ -1345,6 +1472,7 @@ main() {
 	 umount) check_priv ; umount_tomb ${CMD2} ;;
 	  close) check_priv ; umount_tomb ${CMD2} ;;
 	   slam) check_priv ; SLAM=1; umount_tomb ${CMD2} ;;
+	 passwd) check_priv ; change_passwd ${CMD2} ;;
 	   list) list_tombs ${CMD2} ;;
 	 status) launch_status ${CMD2} ;;
 	   help) usage ;;
@@ -1361,7 +1489,7 @@ main() {
 	# internal commands useful to developers
        'source') return 0 ;;
 	install) check_priv ; install_tomb ;;
-	askpass) ask_password $CMD2 ;;
+	askpass) ask_password ${CMD2} ${CMD3} ;;
 	 mktemp) safe_dir ${CMD2} ;;
       translate) generate_translatable_strings ;;
       __default)
