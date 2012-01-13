@@ -1202,7 +1202,7 @@ resize_tomb() {
 	    _failure "key file not found: ${tombkey}"
     fi
 
-    local tmp_resize=/tmp/tmbsrz
+    local tmp_resize=`safe_filename tmbrsz`
     local newtombsize=$opts[-s]
     local oldtombsize=`stat -c %s "${CMD2}" 2>/dev/null`
 	local mounted_tomb=`mount -l |
@@ -1282,14 +1282,12 @@ resize_tomb() {
     if [ $? != 0 ]; then
         losetup -d ${nstloop}
         _failure "e2fsck failed to check $mapper"
-        return 1
     fi
 
     resize2fs /dev/mapper/${mapper}
     if [ $? != 0 ]; then
         losetup -d ${nstloop}
         _failure "resize2fs failed to resize $mapper"
-        return 1
     fi
 
     # close and free the loop device
